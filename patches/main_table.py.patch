@@ -1,0 +1,443 @@
+--- a/tksheet/main_table.py
++++ b/tksheet/main_table.py
+@@ -331,6 +331,14 @@
+         self.RI.set_width(self.PAR.ops.default_row_index_width)
+ 
+         self.char_widths = {}
++        # kit-font-style: per-effective-font baseline for char_width_fn.
++        # char_widths is already keyed by FontTuple; the _test_str baseline
++        # was not, so normal/bold/italic cannot share table_test_str_w.
++        self.test_str_widths = {}
++        # kit-font-family: guard verdicts, keyed by the exact FontTuple that
++        # would be drawn.  Cleared in set_table_font_help because the contract
++        # is measured against table_txt_height, which the global font sets.
++        self._font_ok_cache = {}
+         self.set_table_font_help()
+         self.set_header_font_help()
+         self.set_index_font_help()
+@@ -4029,6 +4037,205 @@
+         b = self.txt_measure_canvas.bbox(self.txt_measure_canvas_text)
+         return b[2] - b[0]
+ 
++    # SUPER-GUI VENDOR EXTENSION: per-cell font style ------------------------
++    #
++    # Style-only: options never store family or size, so zoom, theme rebuilds
++    # and set_table_font() keep working.  get_cell_font() is the SINGLE source
++    # of truth for the effective font of a body cell; every consumer (renderer,
++    # wrap, char metrics, autosize) must ask it and nothing else, so measure ==
++    # wrap == draw can never drift apart.
++    def font_char_widths(self, font: FontTuple) -> dict:
++        """char_widths sub-dict for font, created on first use.
++
++        redraw indexes self.char_widths[font] directly; without lazy creation
++        the first styled cell raises KeyError inside the redraw loop.
++        """
++        try:
++            return self.char_widths[font]
++        except KeyError:
++            d = self.char_widths[font] = {}
++            return d
++
++    def get_test_str_w(self, font: FontTuple) -> int:
++        try:
++            return self.test_str_widths[font]
++        except KeyError:
++            w = self.test_str_widths[font] = self.get_txt_w(_test_str, font)
++            return w
++
++    def get_cell_font_style(self, datarn: int, datacn: int) -> str | None:
++        """cell -> row -> column, via the stock generic option resolver.
++
++        get_cell_kwargs returns {} when the key is absent, so the isinstance
++        check is what turns that into a real None.
++        """
++        style = self.get_cell_kwargs(datarn, datacn, key="font_style")
++        return style if isinstance(style, str) and style else None
++
++    def get_cell_font_family(self, datarn: int, datacn: int) -> str | None:
++        """Local family override using the stock cell -> row -> column resolver."""
++        family = self.get_cell_kwargs(datarn, datacn, key="font_family")
++        if not isinstance(family, str):
++            return None
++        family = family.strip()
++        return family or None
++
++    def font_fits_line_box(self, font: FontTuple) -> bool:
++        """Tier-1 runtime authority for one concrete requested FontTuple.
++
++        Safe means BOTH:
++        1) Tk resolves the requested family name to that same family (no silent
++           substitution), and
++        2) the current family/size/style pipe bbox fits inside the live global
++           table line box.
++
++        The verdict is cached per exact FontTuple and invalidated whenever the
++        global table font/zoom baseline changes.
++        """
++        try:
++            return self._font_ok_cache[font]
++        except KeyError:
++            pass
++        try:
++            resolved = str(self.tk.call("font", "actual", tuple(font), "-family")).strip()
++            same_family = resolved.casefold() == str(font[0]).strip().casefold()
++            ok = same_family and self.get_txt_dimensions("|", font)[1] <= self.table_txt_height
++        except (tk.TclError, TypeError, ValueError, IndexError):
++            ok = False
++        self._font_ok_cache[font] = ok
++        return ok
++
++    def get_cell_font(self, datarn: int, datacn: int) -> FontTuple:
++        """Effective font of one body cell.
++
++        Size is never stored locally: it always comes from the live global
++        table font, so zoom/theme rebuilds remain authoritative.  A family
++        override is accepted only through the Tier-1 runtime guard; otherwise
++        the family fails closed to the live base family while preserving style.
++
++        Style-only behavior remains the already-qualified v2 contract.
++        """
++        base = self.PAR.ops.table_font
++        style = self.get_cell_font_style(datarn, datacn)
++        family = self.get_cell_font_family(datarn, datacn)
++        if style is None and family is None:
++            return base
++        font = FontTuple(family or base[0], base[1], style or base[2])
++        if family is None or self.font_fits_line_box(font):
++            return font
++        return FontTuple(base[0], base[1], style or base[2])
++
++    def font_report(self, family: str, style: str | None = None) -> dict:
++        """Explain the current Tier-1 decision for developer tooling.
++
++        Status is one of: active, fallback, substituted, error.  `effective`
++        always describes the FontTuple the engine will actually hand to its
++        measure/wrap/draw path.
++        """
++        base = self.PAR.ops.table_font
++        family = str(family).strip()
++        want = FontTuple(family, base[1], style or base[2])
++        fallback = FontTuple(base[0], base[1], style or base[2])
++        report = {
++            "requested": tuple(want),
++            "base": tuple(base),
++            "line_box": self.table_txt_height,
++            "effective": tuple(fallback),
++        }
++        try:
++            resolved = str(self.tk.call("font", "actual", tuple(want), "-family")).strip()
++            pipe = self.get_txt_dimensions("|", want)[1]
++        except Exception as exc:
++            report.update(
++                status="error",
++                resolved_as=None,
++                substituted=False,
++                pipe_height=None,
++                overshoot=None,
++                reason=f"{type(exc).__name__}: {exc}",
++            )
++            return report
++
++        substituted = resolved.casefold() != family.casefold()
++        report.update(
++            resolved_as=resolved,
++            substituted=substituted,
++            pipe_height=pipe,
++            overshoot=pipe - self.table_txt_height,
++        )
++        if substituted:
++            report["status"] = "substituted"
++            report["reason"] = (
++                f"{family} resolved as {resolved}; Tier 1 fails closed to {base[0]}"
++            )
++        elif pipe > self.table_txt_height:
++            report["status"] = "fallback"
++            report["reason"] = (
++                f"{family} is {pipe - self.table_txt_height}px taller than the "
++                f"{self.table_txt_height}px line box at size {base[1]}"
++            )
++        else:
++            report["status"] = "active"
++            report["effective"] = tuple(want)
++            report["reason"] = f"{family} fits the {self.table_txt_height}px line box"
++        return report
++
++    def font_styles_present(self) -> bool:
++        """Original v2 semantic: are any local font_style options present?"""
++        return (
++            any("font_style" in v for v in self.col_options.values())
++            or any("font_style" in v for v in self.row_options.values())
++            or any("font_style" in v for v in self.cell_options.values())
++        )
++
++    def cell_fonts_present(self) -> bool:
++        """Fast-path gate for either local font_style or font_family options."""
++        if self.font_styles_present():
++            return True
++        return (
++            any("font_family" in v for v in self.col_options.values())
++            or any("font_family" in v for v in self.row_options.values())
++            or any("font_family" in v for v in self.cell_options.values())
++        )
++
++    # SUPER-GUI VENDOR EXTENSION: fixed-width segmented text -----------------
++    #
++    # A segmented cell is still one logical tksheet cell.  Only its one-line
++    # display text is painted as N independent Canvas text items at fixed slot
++    # centres.  Hit-testing in kit_grid calls segmented_text_index(), so draw
++    # and hit share this exact geometry and never reconstruct Unicode metrics.
++    @staticmethod
++    def segmented_text_geometry(
++        left: float,
++        right: float,
++        count: int,
++        slot_width: float,
++    ) -> tuple[float, float, tuple[float, ...]]:
++        count = int(count)
++        slot_width = float(slot_width)
++        if count <= 0 or slot_width <= 0:
++            return float(left), float(left), ()
++        run_width = count * slot_width
++        run_left = float(left) + ((float(right) - float(left)) - run_width) / 2.0
++        run_right = run_left + run_width
++        centres = tuple(run_left + (i + 0.5) * slot_width for i in range(count))
++        return run_left, run_right, centres
++
++    @classmethod
++    def segmented_text_index(
++        cls,
++        left: float,
++        right: float,
++        x: float,
++        count: int,
++        slot_width: float,
++    ) -> int | None:
++        run_left, run_right, _ = cls.segmented_text_geometry(left, right, count, slot_width)
++        if not (run_left <= float(x) < run_right):
++            return None
++        index = int((float(x) - run_left) // float(slot_width))
++        return index if 0 <= index < int(count) else None
++
+     def get_txt_h(self, txt: str, font: None | FontTuple = None) -> int:
+         self.txt_measure_canvas.itemconfig(
+             self.txt_measure_canvas_text,
+@@ -4120,6 +4327,10 @@
+             self.char_widths[self.PAR.ops.table_font] = {}
+         self.table_test_str_w = self.get_txt_w(_test_str)
+         self.table_txt_width, self.table_txt_height = self.get_txt_dimensions("|", self.PAR.ops.table_font)
++        # kit-font-family: table_txt_height is the line box every override must
++        # fit into, so every cached verdict is stale the moment it changes -
++        # which includes every zoom step.
++        self._font_ok_cache.clear()
+         self.min_row_height = max(6, self.table_txt_height, self.index_txt_height) + 6
+ 
+         # dropdown stuff
+@@ -4247,7 +4458,12 @@
+     def get_cell_dimensions(self, datarn: int, datacn: int) -> tuple[int, int]:
+         txt = self.cell_str(datarn, datacn, get_displayed=True)
+         if txt:
+-            self.txt_measure_canvas.itemconfig(self.txt_measure_canvas_text, text=txt, font=self.PAR.ops.table_font)
++            # kit-font-style: effective cell font, not the global table font.
++            self.txt_measure_canvas.itemconfig(
++                self.txt_measure_canvas_text,
++                text=txt,
++                font=self.get_cell_font(datarn, datacn),
++            )
+             b = self.txt_measure_canvas.bbox(self.txt_measure_canvas_text)
+             w = b[2] - b[0] + 7
+             h = b[3] - b[1] + 5
+@@ -4369,6 +4585,10 @@
+ 
+     def get_wrapped_cell_height(self, datarn: int, datacn: int) -> int:
+         dispcn = self.dispcn(datacn)
++        # kit-font-style: this is the row-height path RowIndex.get_row_text_height
++        # delegates to.  Style-only never changes glyph height, but a wider face
++        # changes the NUMBER of wrapped lines, and that is what sets row height.
++        font = self.get_cell_font(datarn, datacn)
+         n_lines = max(
+             1,
+             sum(
+@@ -4377,12 +4597,18 @@
+                     text=self.cell_str(datarn, datacn, get_displayed=True),
+                     max_width=self.get_cell_max_width(datarn, dispcn),
+                     max_lines=float("inf"),
+-                    char_width_fn=self.char_width_fn,
+-                    widths=self.char_widths[self.table_font],
++                    char_width_fn=(
++                        self.char_width_fn
++                        if font is self.PAR.ops.table_font
++                        else partial(self.char_width_fn, font=font)
++                    ),
++                    widths=self.font_char_widths(font),
+                     wrap=self.PAR.ops.table_wrap,
+                 )
+             ),
+         )
++        # Vertical metrics stay pinned to the global font by design: style-only
++        # overrides must never trigger a row-geometry rebuild.
+         return 3 + (n_lines * self.table_txt_height)
+ 
+     def set_all_cell_sizes_to_text(
+@@ -4402,6 +4628,8 @@
+         qtxtm = self.txt_measure_canvas_text
+         qtxth = self.table_txt_height
+         qfont = self.PAR.ops.table_font
++        # kit-font-style: fast path keeps this loop bit-identical when unused.
++        per_cell_font = self.cell_fonts_present()
+         numrows = self.total_data_rows()
+         numcols = self.total_data_cols()
+         itercols = range(numcols) if self.all_columns_displayed else self.displayed_columns
+@@ -4423,7 +4651,11 @@
+                 w = hw
+             for datarn in iterrows:
+                 if txt := self.cell_str(datarn, datacn, get_displayed=True):
+-                    qconf(qtxtm, text=txt, font=qfont)
++                    qconf(
++                        qtxtm,
++                        text=txt,
++                        font=self.get_cell_font(datarn, datacn) if per_cell_font else qfont,
++                    )
+                     b = qbbox(qtxtm)
+                     tw = b[2] - b[0] + added_w_space
+                     h = b[3] - b[1] + 5
+@@ -6178,15 +6410,23 @@
+ 
+         return cells
+ 
+-    def char_width_fn(self, c: str) -> int:
+-        if c in self.char_widths[self.table_font]:
+-            return self.char_widths[self.table_font][c]
++    def char_width_fn(self, c: str, font: FontTuple | None = None) -> int:
++        # kit-font-style: font=None keeps every stock call site on table_font.
++        if font is None:
++            font = self.table_font
++            test_str_w = self.table_test_str_w
++            widths = self.char_widths[font]
++        else:
++            test_str_w = self.get_test_str_w(font)
++            widths = self.font_char_widths(font)
++        if c in widths:
++            return widths[c]
+         else:
+             if c == "\t":
+                 self.txt_measure_canvas.itemconfig(
+                     self.txt_measure_canvas_text,
+                     text="\t",
+-                    font=self.table_font,
++                    font=font,
+                 )
+                 b = self.txt_measure_canvas.bbox(self.txt_measure_canvas_text)
+                 wd = b[2] - b[0] - 2
+@@ -6194,11 +6434,11 @@
+                 self.txt_measure_canvas.itemconfig(
+                     self.txt_measure_canvas_text,
+                     text=_test_str + c,
+-                    font=self.table_font,
++                    font=font,
+                 )
+                 b = self.txt_measure_canvas.bbox(self.txt_measure_canvas_text)
+-                wd = b[2] - b[0] - self.table_test_str_w
+-            self.char_widths[self.table_font][c] = wd
++                wd = b[2] - b[0] - test_str_w
++            widths[c] = wd
+             return wd
+ 
+     def redraw_corner(self, x: float, y: float, tags: str | tuple[str]) -> None:
+@@ -6284,7 +6524,10 @@
+         if points:
+             self.redraw_gridline(points)
+ 
+-        font = self.PAR.ops.table_font
++        # kit-font-style: base_font is the unstyled hoisted font; `font` is
++        # rebound per cell inside the loop only when an override exists.
++        base_font = font = self.PAR.ops.table_font
++        per_cell_font = self.cell_fonts_present()
+         dd_coords = self.dropdown.get_coords()
+         selections = self.get_redraw_selections(text_start_row, grid_end_row, text_start_col, grid_end_col)
+         sel_cells_bg = color_tup(self.PAR.ops.table_selected_cells_bg)
+@@ -6507,14 +6750,83 @@
+                         max_width += sum(self._overflow(cells, reversed(range(text_start_col, c)), datarn))
+                 if max_width <= 1:
+                     continue
++
++                # kit-font-style: single rebind covering every draw site below,
++                # segmented renderer included.  Verified that the name `font` is
++                # not read anywhere between the hoist and this point.
++                if per_cell_font:
++                    font = self.get_cell_font(datarn, datacn)
++
++                # SUPER-GUI VENDOR EXTENSION: generic segmented one-line text.
++                # The column option is intentionally domain-free: tksheet does
++                # not know what a rating, star, triangle or criterion is.
++                col_opts = self.col_options.get(datacn, {})
++                segment_count = col_opts.get("segmented_text_count")
++                segment_width = col_opts.get("segmented_text_width")
++                if segment_count and segment_width:
++                    try:
++                        segment_count = int(segment_count)
++                        segment_width = float(segment_width)
++                    except (TypeError, ValueError):
++                        segment_count = 0
++                    if segment_count > 0 and segment_width > 0:
++                        _run_left, _run_right, segment_centres = self.segmented_text_geometry(
++                            cleftgridln, crightgridln, segment_count, segment_width
++                        )
++                        draw_y = rtopgridln + (rbotgridln - rtopgridln) / 2.0
++                        for segment_index, char in enumerate(str(cells[loc])[:segment_count]):
++                            if not char:
++                                continue
++                            segment_tags = tags + (f"segment_{segment_index}",)
++                            if self.hidd_text:
++                                iid, showing = self.hidd_text.popitem()
++                                self.coords(iid, segment_centres[segment_index], draw_y)
++                                if showing:
++                                    self.itemconfig(
++                                        iid,
++                                        text=char,
++                                        fill=fill,
++                                        font=font,
++                                        anchor="center",
++                                        tags=segment_tags,
++                                    )
++                                else:
++                                    self.itemconfig(
++                                        iid,
++                                        text=char,
++                                        fill=fill,
++                                        font=font,
++                                        anchor="center",
++                                        state="normal",
++                                        tags=segment_tags,
++                                    )
++                            else:
++                                iid = self.create_text(
++                                    segment_centres[segment_index],
++                                    draw_y,
++                                    text=char,
++                                    fill=fill,
++                                    font=font,
++                                    anchor="center",
++                                    tags=segment_tags,
++                                )
++                            self.disp_text[iid] = True
++                        continue
++
+                 start_line = max(0, int((scrollpos_top - rtopgridln) / self.table_txt_height))
+                 draw_y = rtopgridln + 3 + (start_line * self.table_txt_height)
+                 gen_lines = wrap_text(
+                     text=cells[loc],
+                     max_width=max_width,
+                     max_lines=int((rbotgridln - rtopgridln - 2) / self.table_txt_height),
+-                    char_width_fn=self.char_width_fn,
+-                    widths=self.char_widths[font],
++                    # kit-font-style: BOTH args must name one effective font.
++                    # widths is read first and char_width_fn only fills misses,
++                    # so a mismatch here misses forever and silently measures
++                    # with the wrong face.
++                    char_width_fn=(
++                        self.char_width_fn if font is base_font else partial(self.char_width_fn, font=font)
++                    ),
++                    widths=self.font_char_widths(font),
+                     wrap=wrap,
+                     start_line=start_line,
+                 )

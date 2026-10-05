@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tksheet-controlled-fork"
+version = "7.6.0+controlled.1"
+description = "Pinned tksheet fork with segmented cells and guarded local typography"
+requires-python = ">=3.10"
+readme = "README.md"
+license = {file = "LICENSE.txt"}
+
+[tool.setuptools]
+packages = ["tksheet"]
+
+[tool.setuptools.package-data]
+tksheet = ["*.txt", "py.typed"]

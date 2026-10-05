@@ -1,0 +1,13 @@
+name: Verify fork
+on: [push, pull_request]
+jobs:
+  windows-tk:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: python -m pip install .
+      - run: python tests/test_runtime.py
+      - run: python tests/run_legacy.py

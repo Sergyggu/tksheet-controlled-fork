@@ -1,0 +1,22 @@
+--- a/tksheet/column_headers.py
++++ b/tksheet/column_headers.py
+@@ -1191,9 +1191,18 @@
+             qtxtm = self.MT.txt_measure_canvas_text
+             qtxth = self.MT.table_txt_height
+             qfont = self.ops.table_font
++            # kit-font-style: this measures TABLE BODY cells, so it must use the
++            # same effective font the body is drawn with.  Reached by double
++            # clicking a header separator, so it is a user path, not only an API
++            # one.  qtxth above is dropdown/checkbox glyph space and stays global.
++            per_cell_font = self.MT.cell_fonts_present()
+             for datarn in iterable:
+                 if txt := self.MT.cell_str(datarn, datacn, get_displayed=True):
+-                    qconf(qtxtm, text=txt, font=qfont)
++                    qconf(
++                        qtxtm,
++                        text=txt,
++                        font=self.MT.get_cell_font(datarn, datacn) if per_cell_font else qfont,
++                    )
+                     b = qbbox(qtxtm)
+                     if (
+                         (
